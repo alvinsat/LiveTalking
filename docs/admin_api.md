@@ -55,7 +55,7 @@ GET /api/admin/config
 | `l` | int | 10 | 音频缓冲参数 |
 | `m` | int | 8 | 音频缓冲参数 |
 | `r` | int | 10 | 音频缓冲参数 |
-| `model` | string | "wav2lip" | Avatar 模型：musetalk / wav2lip / ultralight |
+| `model` | string | "wav2lip" | Avatar 模型：ditto / musetalk / wav2lip / ultralight；Ditto 为单会话实时 worker |
 | `avatar_id` | string | "wav2lip256_avatar1" | 默认 Avatar 标识 |
 | `data_path` | string | "data/avatars" | Avatar 数据目录 |
 | `batch_size` | int | 16 | 推理批大小 |
@@ -123,4 +123,3 @@ GET /api/admin/sessions
 | `customopt` | array | 自定义动作配置 |
 
 ---
-

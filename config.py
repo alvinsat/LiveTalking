@@ -59,7 +59,7 @@ def parse_args():
 
     # ─── 数字人模型 ────────────────────────────────────────────────────
     parser.add_argument('--model', type=str, default='wav2lip',
-                        help="avatar model: musetalk/wav2lip/ultralight")
+                        help="avatar model: ditto/musetalk/wav2lip/ultralight")
     parser.add_argument('--avatar_id', type=str, default='wav2lip256_avatar1',
                         help="avatar id in data/avatars")
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
@@ -69,6 +69,23 @@ def parse_args():
                         default='openvino', help="inference runtime")
     parser.add_argument('--openvino_device', type=str, default='AUTO',
                         help="OpenVINO GPU device, or AUTO to require and select a GPU")
+    parser.add_argument('--ditto_root', type=str, default=r'..\ditto-talkinghead',
+                        help="path to the Ditto repository, relative to LiveTalking")
+    parser.add_argument('--ditto_python', type=str, default='',
+                        help="Python executable in the Ditto environment")
+    parser.add_argument('--ditto_data_root', type=str,
+                        default=r'.\checkpoints\ditto_onnx',
+                        help="Ditto TensorRT model directory, relative to ditto_root")
+    parser.add_argument('--ditto_cfg_pkl', type=str,
+                        default=r'.\checkpoints\ditto_cfg\v0.4_hubert_cfg_trt_online.pkl',
+                        help="Ditto online config pickle, relative to ditto_root")
+    parser.add_argument('--ditto_source_path', type=str,
+                        default=r'..\ditto-talkinghead\example\image.png',
+                        help="Ditto source image/video, relative to LiveTalking")
+    parser.add_argument('--ditto_worker_host', type=str, default='127.0.0.1')
+    parser.add_argument('--ditto_worker_port', type=int, default=8765)
+    parser.add_argument('--ditto_cpu_threads', type=int, default=8,
+                        help="CPU thread pool size for Ditto's non-GPU operations")
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',

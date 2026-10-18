@@ -4,6 +4,8 @@ import numpy as np
 import resampy
 import soundfile as sf
 import edge_tts
+import subprocess
+from threading import Thread
 from io import BytesIO
 
 from utils.logger import logger
@@ -16,6 +18,16 @@ class EdgeTTS(BaseTTS):
         text,textevent = msg
         voice = self.opt.REF_FILE or "zh-CN-YunxiaNeural" 
         voicename = textevent.get('tts', {}).get('ref_file',voice) #self.opt.REF_FILE #"zh-CN-YunxiaNeural"
+        if getattr(self.parent, 'is_streaming_avatar', False):
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(
+                    self.__stream_to_ditto(voicename, text, textevent)
+                )
+            finally:
+                loop.close()
+            return
+
         t = time.time()
         asyncio.new_event_loop().run_until_complete(self.__main(voicename,text))
         logger.info(f'-------edge tts time:{time.time()-t:.4f}s')
@@ -41,6 +53,97 @@ class EdgeTTS(BaseTTS):
         #    self.queue.put(stream[idx:])
         self.input_stream.seek(0)
         self.input_stream.truncate() 
+
+    async def __stream_to_ditto(self, voicename, text, textevent):
+        command = [
+            'ffmpeg', '-loglevel', 'error',
+            '-f', 'mp3', '-i', 'pipe:0',
+            '-f', 's16le', '-acodec', 'pcm_s16le',
+            '-ar', str(self.sample_rate), '-ac', '1', 'pipe:1',
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        reader_errors = []
+        emitted_audio = [False]
+
+        def enqueue_pcm(block, first=False, final=False):
+            if self.state != State.RUNNING:
+                return
+            eventpoint = {'text': text}
+            if first:
+                eventpoint['status'] = 'start'
+            if final:
+                eventpoint['status'] = 'end'
+            eventpoint.update(**textevent)
+            pcm = np.frombuffer(block, dtype='<i2').astype(np.float32) / 32768.0
+            self.parent.put_audio_frame(pcm, eventpoint)
+            emitted_audio[0] = True
+
+        def read_pcm():
+            pending = None
+            first = True
+            remainder = bytearray()
+            try:
+                while True:
+                    data = process.stdout.read1(4096)
+                    if not data:
+                        break
+                    remainder.extend(data)
+                    while len(remainder) >= self.chunk * 2:
+                        block = bytes(remainder[:self.chunk * 2])
+                        del remainder[:self.chunk * 2]
+                        if pending is not None:
+                            enqueue_pcm(pending, first=first)
+                            first = False
+                        pending = block
+                if remainder:
+                    remainder.extend(bytes(self.chunk * 2 - len(remainder)))
+                    block = bytes(remainder)
+                    if pending is not None:
+                        enqueue_pcm(pending, first=first)
+                        first = False
+                    pending = block
+                if pending is not None:
+                    enqueue_pcm(pending, first=first, final=True)
+            except Exception as error:
+                reader_errors.append(error)
+
+        reader = Thread(target=read_pcm, daemon=True, name="edge-tts-pcm-reader")
+        reader.start()
+        try:
+            communicate = edge_tts.Communicate(text, voicename)
+            async for chunk in communicate.stream():
+                if self.state != State.RUNNING:
+                    break
+                if chunk.get('type') == 'audio':
+                    process.stdin.write(chunk['data'])
+                    process.stdin.flush()
+        except Exception:
+            process.terminate()
+            process.wait()
+            reader.join()
+            logger.exception('edge tts streaming to Ditto failed')
+            raise
+        finally:
+            if process.stdin and not process.stdin.closed:
+                process.stdin.close()
+
+        reader.join()
+        stderr = process.stderr.read()
+        return_code = process.wait()
+        if reader_errors:
+            raise RuntimeError('Could not stream decoded Edge TTS audio') from reader_errors[0]
+        if return_code:
+            raise RuntimeError(
+                f"FFmpeg could not decode Edge TTS audio: "
+                f"{stderr.decode('utf-8', errors='replace').strip()}"
+            )
+        if not emitted_audio[0] and self.state == State.RUNNING:
+            raise RuntimeError('Edge TTS returned no decodable audio for Ditto')
 
     def __create_bytes_stream(self,byte_stream):
         #byte_stream=BytesIO(buffer)

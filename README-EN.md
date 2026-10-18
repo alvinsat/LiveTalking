@@ -40,7 +40,7 @@ Get started with $1 in free credits, a discount on your first top-up, and saving
 ---
 
 ## Features
-1. Supports multiple digital human models: ernerf, musetalk, wav2lip, Ultralight-Digital-Human
+1. Supports multiple digital human models: Ditto, ernerf, musetalk, wav2lip, Ultralight-Digital-Human
 2. Supports voice cloning
 3. Supports interrupting the digital human while speaking
 4. Supports full-body video stitching
@@ -166,6 +166,10 @@ python app.py --transport webrtc --model wav2lip --avatar_id wav2lip256_avatar1
 
 ### 2.6 Documentation
 <https://doc.livetalking.ai/en>
+
+### Realtime Ditto integration
+
+See [docs/ditto-live.md](docs/ditto-live.md) for setup and GPU/backend details. Ditto runs as a persistent online worker and streams generated frames directly; it does not wait for an MP4.
 
 ---
 

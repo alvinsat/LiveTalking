@@ -9,11 +9,21 @@ m: 8
 r: 10
 
 # -------- Avatar Model ----------------------------------------------------------
-model: wav2lip                 # musetalk / wav2lip / ultralight
+model: wav2lip                 # ditto / musetalk / wav2lip / ultralight
 avatar_id: wav2lip256_avatar1
 batch_size: 16
 inference_backend: openvino    # openvino / torch
 openvino_device: AUTO          # GPU / AUTO (CPU inference is disabled)
+
+# -------- Ditto live worker (used only when model: ditto) --------------------
+ditto_root: ..\ditto-talkinghead
+ditto_python: ''               # set to the Python executable in the Ditto GPU environment
+ditto_data_root: .\checkpoints\ditto_onnx
+ditto_cfg_pkl: .\checkpoints\ditto_cfg\v0.4_hubert_cfg_trt_online.pkl
+ditto_source_path: ..\ditto-talkinghead\example\image.png
+ditto_worker_host: 127.0.0.1
+ditto_worker_port: 8765
+ditto_cpu_threads: 8
 
 # -------- Custom Actions ----------------------------------------------------------
 customvideo_config: ''

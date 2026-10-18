@@ -48,6 +48,10 @@ import random
 import shutil
 import asyncio
 import torch
+import subprocess
+import socket
+import sys
+import time
 from io import BytesIO
 from typing import Dict
 from utils.logger import logger
@@ -67,6 +71,64 @@ global_avatars = {} # avatar_id: payload
 #####webrtc###############################
 # rtc_manager replaces the old pcs set and duplicate offer handlers.
 rtc_manager = None
+ditto_worker_process = None
+
+
+def start_ditto_worker(opt):
+    ditto_root = os.path.abspath(opt.ditto_root)
+    worker_path = os.path.join(ditto_root, 'livetalking_worker.py')
+    source_path = os.path.abspath(opt.ditto_source_path)
+    data_root = os.path.abspath(os.path.join(ditto_root, opt.ditto_data_root))
+    cfg_pkl = os.path.abspath(os.path.join(ditto_root, opt.ditto_cfg_pkl))
+    for required_path in (worker_path, source_path, data_root, cfg_pkl):
+        if not os.path.exists(required_path):
+            raise FileNotFoundError(f"Ditto worker input does not exist: {required_path}")
+
+    command = [
+        opt.ditto_python or sys.executable,
+        worker_path,
+        '--host', opt.ditto_worker_host,
+        '--port', str(opt.ditto_worker_port),
+        '--data-root', data_root,
+        '--cfg-pkl', cfg_pkl,
+        '--source-path', source_path,
+        '--cpu-threads', str(opt.ditto_cpu_threads),
+    ]
+    process = subprocess.Popen(command, cwd=ditto_root)
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Ditto worker exited during startup with code {process.returncode}"
+            )
+        try:
+            with socket.create_connection(
+                (opt.ditto_worker_host, opt.ditto_worker_port), timeout=1
+            ) as connection:
+                connection.sendall(b'\x00')
+                if connection.recv(1) == b'\x01':
+                    logger.info("Ditto worker is ready")
+                    return process
+        except OSError:
+            time.sleep(1)
+
+    process.terminate()
+    process.wait(timeout=10)
+    raise TimeoutError("Ditto worker did not become ready within 10 minutes")
+
+
+def stop_ditto_worker():
+    global ditto_worker_process
+    if ditto_worker_process is None:
+        return
+    if ditto_worker_process.poll() is None:
+        ditto_worker_process.terminate()
+        try:
+            ditto_worker_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            ditto_worker_process.kill()
+            ditto_worker_process.wait()
+    ditto_worker_process = None
 
 def randN(N)->int:
     '''生成长度为 N的随机数 '''
@@ -82,7 +144,9 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this.avatar_id = avatar_id
     ref_audio = params.get('refaudio','') #音色
     ref_text = params.get('reftext','')
-    if (avatar_id and avatar_id != opt.avatar_id):
+    if opt.model == 'ditto':
+        avatar_this = None
+    elif (avatar_id and avatar_id != opt.avatar_id):
         # Avoid reloading if already cached globally
         if avatar_id not in global_avatars:
             global_avatars[avatar_id] = load_avatar(avatar_id, opt)
@@ -125,29 +189,36 @@ async def download_record(request):
 
 
 def main():
-    global rtc_manager, opt, model,load_avatar
+    global rtc_manager, opt, model, load_avatar, ditto_worker_process
     # 解析命令行参数
     from config import parse_args
     opt = parse_args()
 
     # ─── 加载 avatar 插件（触发 @register 注册）──────────────────────
     _avatar_modules = {
+        'ditto':      'avatars.ditto_avatar',
         'musetalk':   'avatars.musetalk_avatar',
         'wav2lip':    'avatars.wav2lip_avatar',
         'ultralight': 'avatars.ultralight_avatar',
     }
     import importlib
     avatar_mod = importlib.import_module(_avatar_modules[opt.model])
-    load_model = avatar_mod.load_model
-    load_avatar = avatar_mod.load_avatar
-    warm_up = avatar_mod.warm_up
+    if opt.model == 'ditto':
+        ditto_worker_process = start_ditto_worker(opt)
+    else:
+        load_model = avatar_mod.load_model
+        load_avatar = avatar_mod.load_avatar
+        warm_up = avatar_mod.warm_up
     logger.info(opt)
-    logger.info(
-        "Inference backend: %s%s",
-        opt.inference_backend,
-        f" ({opt.openvino_device})" if opt.inference_backend == 'openvino' else '',
-    )
-    if opt.inference_backend == 'torch':
+    if opt.model == 'ditto':
+        logger.info("Ditto inference runs in its persistent GPU worker")
+    else:
+        logger.info(
+            "Inference backend: %s%s",
+            opt.inference_backend,
+            f" ({opt.openvino_device})" if opt.inference_backend == 'openvino' else '',
+        )
+    if opt.model != 'ditto' and opt.inference_backend == 'torch':
         torch_device = initialize_device()
         logger.info(
             "Inference device: %s (%s)",
@@ -155,7 +226,9 @@ def main():
             torch_device,
         )
 
-    if opt.model == 'musetalk':
+    if opt.model == 'ditto':
+        model = None
+    elif opt.model == 'musetalk':
         model = load_model(opt)
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id, opt)
         warm_up(opt.batch_size,model)      
@@ -169,7 +242,7 @@ def main():
         warm_up(opt.batch_size,global_avatars[opt.avatar_id],160)
 
     # init rtc manager
-    session_manager.set_max_session(opt.max_session)
+    session_manager.set_max_session(1 if opt.model == 'ditto' else opt.max_session)
     session_manager.init_builder(build_avatar_session)
     rtc_manager = RTCManager(opt)
     # share avatar_sessions (RTCManager handles it but routes.py expects it)
@@ -229,7 +302,8 @@ def main():
             site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
             loop.run_until_complete(site.start())
             if opt.transport == 'rtcpush':
-                for k in range(opt.max_session):
+                push_count = 1 if opt.model == 'ditto' else opt.max_session
+                for k in range(push_count):
                     push_url = opt.push_url
                     if k != 0:
                         push_url = opt.push_url + str(k)
@@ -250,6 +324,7 @@ def main():
                     thread_quit.set()
                 if rendthrd is not None:
                     rendthrd.join()
+                stop_ditto_worker()
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.close()
 
