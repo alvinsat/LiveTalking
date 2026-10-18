@@ -23,7 +23,8 @@ ditto_cfg_pkl: .\checkpoints\ditto_cfg\v0.4_hubert_cfg_trt_online.pkl
 ditto_source_path: ..\ditto-talkinghead\example\image.png
 ditto_worker_host: 127.0.0.1
 ditto_worker_port: 8765
-ditto_cpu_threads: 8
+ditto_cpu_threads: 4
+ditto_max_size: 1024
 
 # -------- Custom Actions ----------------------------------------------------------
 customvideo_config: ''

@@ -84,8 +84,10 @@ def parse_args():
                         help="Ditto source image/video, relative to LiveTalking")
     parser.add_argument('--ditto_worker_host', type=str, default='127.0.0.1')
     parser.add_argument('--ditto_worker_port', type=int, default=8765)
-    parser.add_argument('--ditto_cpu_threads', type=int, default=8,
+    parser.add_argument('--ditto_cpu_threads', type=int, default=4,
                         help="CPU thread pool size for Ditto's non-GPU operations")
+    parser.add_argument('--ditto_max_size', type=int, default=1024,
+                        help="maximum Ditto avatar resolution; lower reduces GPU power")
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',

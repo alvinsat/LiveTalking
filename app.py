@@ -93,6 +93,7 @@ def start_ditto_worker(opt):
         '--cfg-pkl', cfg_pkl,
         '--source-path', source_path,
         '--cpu-threads', str(opt.ditto_cpu_threads),
+        '--max-size', str(opt.ditto_max_size),
     ]
     process = subprocess.Popen(command, cwd=ditto_root)
     deadline = time.monotonic() + 600

@@ -55,7 +55,8 @@ class PlayerStreamTrack(MediaStreamTrack):
         super().__init__()  # don't forget this!
         self.kind = kind
         self._player = player
-        self._queue = queue.Queue(maxsize=100)
+        queue_size = (5 if kind == 'video' else 10) if player._drop_stale_media else 100
+        self._queue = queue.Queue(maxsize=queue_size)
         self.timelist = [] #记录最近包的时间戳
         self.current_frame_count = 0
         if self.kind == 'video':
@@ -83,10 +84,18 @@ class PlayerStreamTrack(MediaStreamTrack):
                 #     self.timelist.pop(0)
                 # self.timelist.append(time.time())
             else:
-                self._start = time.time()
-                self._timestamp = 0
+                if self._player._synchronize_tracks:
+                    if self._player._media_start_time is None:
+                        self._player._media_start_time = time.time()
+                    elapsed = max(0, time.time() - self._player._media_start_time)
+                    self._start = self._player._media_start_time
+                    self.current_frame_count = round(elapsed / VIDEO_PTIME)
+                    self._timestamp = self.current_frame_count * int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
+                else:
+                    self._start = time.time()
+                    self._timestamp = 0
                 self.timelist.append(self._start)
-                mylogger.info('video start:%f',self._start)
+                mylogger.info('%s start:%f', self.kind, self._start)
             return self._timestamp, VIDEO_TIME_BASE
         else: #audio
             if hasattr(self, "_timestamp"):
@@ -102,10 +111,18 @@ class PlayerStreamTrack(MediaStreamTrack):
                 #     self.timelist.pop(0)
                 # self.timelist.append(time.time())
             else:
-                self._start = time.time()
-                self._timestamp = 0
+                if self._player._synchronize_tracks:
+                    if self._player._media_start_time is None:
+                        self._player._media_start_time = time.time()
+                    elapsed = max(0, time.time() - self._player._media_start_time)
+                    self._start = self._player._media_start_time
+                    self.current_frame_count = round(elapsed / AUDIO_PTIME)
+                    self._timestamp = self.current_frame_count * int(AUDIO_PTIME * SAMPLE_RATE)
+                else:
+                    self._start = time.time()
+                    self._timestamp = 0
                 self.timelist.append(self._start)
-                mylogger.info('audio start:%f',self._start)
+                mylogger.info('%s start:%f', self.kind, self._start)
             return self._timestamp, AUDIO_TIME_BASE
 
     async def recv(self) -> Union[Frame, Packet]:
@@ -179,6 +196,11 @@ class HumanPlayer:
         self.__started: Set[PlayerStreamTrack] = set()
         self.__audio: Optional[PlayerStreamTrack] = None
         self.__video: Optional[PlayerStreamTrack] = None
+        self._synchronize_tracks = bool(
+            getattr(avatar_session, 'is_streaming_avatar', False)
+        )
+        self._drop_stale_media = self._synchronize_tracks
+        self._media_start_time = None
 
         self.__audio = PlayerStreamTrack(self, kind="audio")
         self.__video = PlayerStreamTrack(self, kind="video")
@@ -190,14 +212,27 @@ class HumanPlayer:
     def push_video(self, frame):
         from av import VideoFrame
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        self.__video._queue.put((new_frame, None))
+        self._enqueue_media(self.__video, (new_frame, None))
 
     def push_audio(self, frame, eventpoint=None):
         from av import AudioFrame
         new_frame = AudioFrame(format='s16', layout='mono', samples=frame.shape[0])
         new_frame.planes[0].update(frame.tobytes())
         new_frame.sample_rate = 16000
-        self.__audio._queue.put((new_frame, eventpoint))
+        self._enqueue_media(self.__audio, (new_frame, eventpoint))
+
+    def _enqueue_media(self, track, item):
+        if not self._drop_stale_media:
+            track._queue.put(item)
+            return
+        try:
+            track._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                track._queue.get_nowait()
+            except queue.Empty:
+                pass
+            track._queue.put_nowait(item)
 
     def get_buffer_size(self) -> int:
         return self.__video._queue.qsize()

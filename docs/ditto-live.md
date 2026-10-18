@@ -3,7 +3,7 @@
 LiveTalking can use Ditto as a persistent, streaming avatar backend:
 
 1. LiveTalking starts one Ditto worker process and waits until its model is loaded.
-2. The worker stays warm and drives Ditto with silence between utterances, producing idle motion.
+2. The worker keeps model weights loaded but skips inference on silence to reduce idle GPU power; LiveTalking shows the source image while idle.
 3. LiveTalking sends 16 kHz mono PCM packets to that worker as they are played.
 4. Ditto's online HuBERT pipeline returns frames continuously; LiveTalking sends the frames and matching audio through its existing WebRTC, RTMP, or virtual-camera output.
 
@@ -21,7 +21,8 @@ ditto_python: 'C:\path\to\ditto\python.exe'
 ditto_data_root: .\checkpoints\ditto_onnx
 ditto_cfg_pkl: .\checkpoints\ditto_cfg\v0.4_hubert_cfg_trt_online.pkl
 ditto_source_path: ..\ditto-talkinghead\example\image.png
-ditto_cpu_threads: 8
+ditto_cpu_threads: 4
+ditto_max_size: 1024
 ```
 
 Paths for `ditto_data_root` and `ditto_cfg_pkl` are relative to `ditto_root`. `ditto_source_path` is relative to the LiveTalking working directory. Start LiveTalking from its repository directory:
@@ -30,10 +31,10 @@ Paths for `ditto_data_root` and `ditto_cfg_pkl` are relative to `ditto_root`. `d
 python app.py
 ```
 
-The Ditto worker loads the online pipeline at startup and processes silence to stay warm. Startup can take several minutes while models and the source image are loaded. Ditto's ONNX runtime prefers an available GPU execution provider; the ONNX LMDM model uses CPU by default in this Ditto revision because its expression output collapsed on the tested OpenVINO GPU path. Other ONNX components remain GPU-first. For the highest throughput, use compatible Ditto TensorRT engines by setting `ditto_data_root` to the downloaded TensorRT directory; Ditto's online config remains `v0.4_hubert_cfg_trt_online.pkl`.
+The Ditto worker loads the online pipeline at startup; startup can take several minutes while models and the source image are loaded. Inference pauses on silence but the model stays resident for the next response. Ditto's ONNX runtime prefers an available GPU execution provider; the ONNX LMDM model uses CPU by default in this Ditto revision because its expression output collapsed on the tested OpenVINO GPU path. Other ONNX components remain GPU-first. For the highest throughput, use compatible Ditto TensorRT engines by setting `ditto_data_root` to the downloaded TensorRT directory; Ditto's online config remains `v0.4_hubert_cfg_trt_online.pkl`.
 
 ## Current scope
 
 The current Ditto SDK has mutable per-avatar streaming state. This integration therefore limits LiveTalking to **one active Ditto session** and one configured source image/video. Other avatar backends retain their existing concurrency behavior. A future multi-session implementation should share model instances while isolating per-session avatar and audio state.
 
-Ditto's online audio context and model inference impose some startup delay before the first speech-driven frame. End-to-end latency also depends on TTS generation, GPU throughput, and output transport; verify sustained output near 25 video fps on the target GPU.
+The default `ditto_max_size: 1024` caps source resolution to reduce inference load; lower it further to reduce GPU power if the target hardware still sustains realtime. CPU inference threads default to four and can be adjusted with `ditto_cpu_threads`. WebRTC media tracks share one clock. For Ditto, audio playback is held to the ordered generated-frame stream: audio advances only as its corresponding video frames are available, and frames are not discarded to hide inference lag. This avoids playing speech ahead of its lip motion, but inference slower than realtime will add latency and may cause pauses. Ditto's online audio context and model inference impose some startup delay before the first speech-driven frame. End-to-end latency also depends on TTS generation, GPU throughput, and output transport; verify sustained output near 25 video fps on the target GPU.
