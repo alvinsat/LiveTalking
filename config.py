@@ -80,8 +80,15 @@ def parse_args():
                         default=r'.\checkpoints\ditto_cfg\v0.4_hubert_cfg_trt_online.pkl',
                         help="Ditto online config pickle, relative to ditto_root")
     parser.add_argument('--ditto_source_path', type=str,
-                        default=r'..\ditto-talkinghead\example\image.png',
+                        default=r'..\ditto-talkinghead\example\idle.mp4',
                         help="Ditto source image/video, relative to LiveTalking")
+    parser.add_argument('--ditto_idle_video_path', type=str, default='',
+                        help="optional idle loop video, relative to LiveTalking")
+    parser.add_argument('--ditto_patch_region', choices=('face', 'lower_face'),
+                        default='lower_face',
+                        help="region Ditto composites over its source video")
+    parser.add_argument('--ditto_sampling_timesteps', type=int, default=15,
+                        help="Ditto motion diffusion steps; lower is faster")
     parser.add_argument('--ditto_worker_host', type=str, default='127.0.0.1')
     parser.add_argument('--ditto_worker_port', type=int, default=8765)
     parser.add_argument('--ditto_cpu_threads', type=int, default=4,

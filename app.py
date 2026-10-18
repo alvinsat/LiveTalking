@@ -78,6 +78,12 @@ def start_ditto_worker(opt):
     ditto_root = os.path.abspath(opt.ditto_root)
     worker_path = os.path.join(ditto_root, 'livetalking_worker.py')
     source_path = os.path.abspath(opt.ditto_source_path)
+    if opt.ditto_idle_video_path:
+        opt.ditto_idle_video_path = os.path.abspath(opt.ditto_idle_video_path)
+        if not os.path.isfile(opt.ditto_idle_video_path):
+            raise FileNotFoundError(
+                f"Ditto idle video does not exist: {opt.ditto_idle_video_path}"
+            )
     data_root = os.path.abspath(os.path.join(ditto_root, opt.ditto_data_root))
     cfg_pkl = os.path.abspath(os.path.join(ditto_root, opt.ditto_cfg_pkl))
     for required_path in (worker_path, source_path, data_root, cfg_pkl):
@@ -92,6 +98,8 @@ def start_ditto_worker(opt):
         '--data-root', data_root,
         '--cfg-pkl', cfg_pkl,
         '--source-path', source_path,
+        '--patch-region', opt.ditto_patch_region,
+        '--sampling-timesteps', str(opt.ditto_sampling_timesteps),
         '--cpu-threads', str(opt.ditto_cpu_threads),
         '--max-size', str(opt.ditto_max_size),
     ]

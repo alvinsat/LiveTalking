@@ -32,6 +32,10 @@ class WebRTCOutput(BaseOutput):
         if self._player:
             self._player.push_audio(frame, eventpoint)
 
+    def push_media_bundle(self, audio_frame, video_frame=None, eventpoint=None) -> None:
+        if self._player:
+            self._player.push_media_bundle(audio_frame, video_frame, eventpoint)
+
 
 
     def get_buffer_size(self) -> int:

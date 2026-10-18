@@ -1,4 +1,3 @@
-from collections import deque
 import queue
 import socket
 import struct
@@ -13,25 +12,29 @@ from registry import register
 from utils.logger import logger
 
 
+_END_RESPONSE = object()
+
+
 @register("avatar", "ditto")
 class DittoAvatar(BaseAvatar):
     is_streaming_avatar = True
-    speech_hangover_seconds = 0.4
+    idle_video_fps = 12.5
+    max_cached_idle_frames = 64
 
     def __init__(self, opt, model=None, avatar=None):
         super().__init__(opt)
         self.audio_queue = queue.Queue(maxsize=50)
-        self.video_queue = queue.Queue(maxsize=8)
-        self._pending_audio = deque()
-        self._audio_frame_credit = 0
-        self._frame_lock = threading.Lock()
-        self._latest_frame = cv2.imread(opt.ditto_source_path)
+        self.video_queue = queue.Queue()
+        self._interrupt_requested = threading.Event()
+        idle_path = opt.ditto_idle_video_path or opt.ditto_source_path
+        self._latest_frame = cv2.imread(idle_path)
+        self._idle_video_path = self._latest_frame is None
         if self._latest_frame is None:
-            source_video = cv2.VideoCapture(opt.ditto_source_path)
+            source_video = cv2.VideoCapture(idle_path)
             ok, self._latest_frame = source_video.read()
             source_video.release()
         if self._latest_frame is None:
-            raise ValueError(f"Could not read Ditto source: {opt.ditto_source_path}")
+            raise ValueError(f"Could not read Ditto idle source: {idle_path}")
         self._idle_frame = self._latest_frame.copy()
 
         self._connection = socket.create_connection(
@@ -42,10 +45,18 @@ class DittoAvatar(BaseAvatar):
         if not height or not width:
             self._connection.close()
             raise RuntimeError("Ditto worker returned an invalid frame size")
-        self._frame_shape = (height, width, 3)
         if self._idle_frame.shape[:2] != (height, width):
             self._idle_frame = cv2.resize(self._idle_frame, (width, height))
             self._latest_frame = self._idle_frame.copy()
+        if self._idle_video_path:
+            self._idle_frames, self._idle_video_fps = self._cache_idle_video(
+                idle_path, width, height
+            )
+        else:
+            self._idle_frames = [self._encode_idle_frame(self._idle_frame)]
+            self._idle_video_fps = self.idle_video_fps
+        self._idle_frame_index = 0
+        self._idle_frame = self._decode_idle_frame(0)
         self._connection.settimeout(None)
         self._closing = False
         self._reader_error = None
@@ -54,13 +65,72 @@ class DittoAvatar(BaseAvatar):
         )
         self._reader_thread.start()
 
+    @staticmethod
+    def _encode_idle_frame(frame):
+        ok, encoded = cv2.imencode(
+            ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85]
+        )
+        if not ok:
+            raise RuntimeError("Could not cache a Ditto idle frame")
+        return encoded
+
+    def _cache_idle_video(self, path, width, height):
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            capture.release()
+            raise ValueError(f"Could not reopen Ditto idle video: {path}")
+
+        source_fps = capture.get(cv2.CAP_PROP_FPS)
+        if not np.isfinite(source_fps) or source_fps <= 0:
+            source_fps = 25.0
+        sample_every = max(1, round(source_fps / self.idle_video_fps))
+        cached_fps = source_fps / sample_every
+        frames = []
+        frame_index = 0
+        try:
+            while len(frames) < self.max_cached_idle_frames:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                if frame_index % sample_every == 0:
+                    if frame.shape[:2] != (height, width):
+                        frame = cv2.resize(frame, (width, height))
+                    frames.append(self._encode_idle_frame(frame))
+                frame_index += 1
+        finally:
+            capture.release()
+
+        if not frames:
+            raise ValueError(f"Ditto idle video contains no readable frames: {path}")
+        logger.info(
+            "Cached %d Ditto idle frames at %.2f fps",
+            len(frames),
+            cached_fps,
+        )
+        return frames, cached_fps
+
+    def _decode_idle_frame(self, index):
+        frame = cv2.imdecode(self._idle_frames[index], cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError(f"Could not decode cached Ditto idle frame {index}")
+        return frame
+
+    def _get_idle_frame(self, now, loop_start):
+        if len(self._idle_frames) == 1:
+            return self._idle_frame
+        index = int((now - loop_start) * self._idle_video_fps) % len(self._idle_frames)
+        if index != self._idle_frame_index:
+            self._idle_frame = self._decode_idle_frame(index)
+            self._idle_frame_index = index
+        return self._idle_frame
+
     def put_audio_frame(self, audio_chunk, datainfo=None):
         audio_chunk = np.asarray(audio_chunk, dtype=np.float32).reshape(-1)
         if len(audio_chunk) != self.chunk:
             raise ValueError(
                 f"Ditto expects {self.chunk}-sample audio packets, received {len(audio_chunk)}"
             )
-        self.audio_queue.put((audio_chunk.copy(), datainfo or {}))
+        self.audio_queue.put((audio_chunk.copy(), dict(datainfo or {})))
 
     def flush_talk(self):
         super().flush_talk()
@@ -69,6 +139,7 @@ class DittoAvatar(BaseAvatar):
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
+        self._interrupt_requested.set()
         self.speaking = False
 
     @staticmethod
@@ -88,18 +159,11 @@ class DittoAvatar(BaseAvatar):
                 (length,) = struct.unpack("!I", header)
                 if length == 0:
                     raise RuntimeError("Ditto worker stopped its video stream")
-                expected_bytes = int(np.prod(self._frame_shape))
-                if length != expected_bytes:
-                    raise RuntimeError(f"Invalid Ditto frame size: {length}")
+                if length == 0xFFFFFFFF:
+                    self.video_queue.put(_END_RESPONSE)
+                    continue
                 payload = self._recv_exact(self._connection, length)
-                frame_rgb = np.frombuffer(payload, dtype=np.uint8).reshape(self._frame_shape)
-                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                while not self._closing:
-                    try:
-                        self.video_queue.put(frame, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
+                self.video_queue.put(payload)
         except (OSError, ConnectionError, RuntimeError, cv2.error) as error:
             if not getattr(self, "_closing", False):
                 self._reader_error = error
@@ -111,8 +175,16 @@ class DittoAvatar(BaseAvatar):
         self.output.start()
 
         next_audio_time = time.monotonic()
-        last_input_speech_time = None
-        last_output_speech_time = None
+        idle_loop_start = next_audio_time
+        response_audio = []
+        response_frames = []
+        response_started = False
+        response_end_sent = False
+        discard_response = False
+        playback_audio = None
+        playback_frames = None
+        playback_index = 0
+        last_audio_received = None
         tick = 0
         logger.info("Starting persistent Ditto avatar stream for session %s", self.sessionid)
         try:
@@ -123,65 +195,151 @@ class DittoAvatar(BaseAvatar):
                     if quit_event.is_set():
                         break
 
-                try:
-                    audio_chunk, eventpoint = self.audio_queue.get_nowait()
-                except queue.Empty:
-                    audio_chunk = np.zeros((self.chunk,), dtype=np.float32)
-                    eventpoint = {}
-
-                now = time.monotonic()
-                if float(np.sqrt(np.mean(audio_chunk * audio_chunk))) >= 0.003:
-                    last_input_speech_time = now
-                input_active = (
-                    last_input_speech_time is not None
-                    and now - last_input_speech_time <= self.speech_hangover_seconds
-                )
-                if input_active:
-                    self._pending_audio.append((audio_chunk.copy(), eventpoint))
-
-                pcm16 = np.clip(audio_chunk * 32767.0, -32768, 32767).astype("<i2")
-                self._connection.sendall(pcm16.tobytes())
-
-                if tick % 2 == 0:
-                    try:
-                        frame = self.video_queue.get_nowait()
-                    except queue.Empty:
-                        frame = None
-                    if frame is not None:
-                        with self._frame_lock:
-                            self._latest_frame = frame
-                        self._audio_frame_credit += 2
-
-                if self._audio_frame_credit:
-                    self._audio_frame_credit -= 1
-                    try:
-                        audio_chunk, eventpoint = self._pending_audio.popleft()
-                    except IndexError:
-                        audio_chunk = np.zeros((self.chunk,), dtype=np.float32)
-                        eventpoint = {}
-                else:
-                    audio_chunk = np.zeros((self.chunk,), dtype=np.float32)
-                    eventpoint = {}
-
-                pcm16 = np.clip(audio_chunk * 32767.0, -32768, 32767).astype("<i2")
-                self.output.push_audio_frame(pcm16, eventpoint)
-                self.record_audio_data(pcm16)
-                output_now = time.monotonic()
-                if float(np.sqrt(np.mean(audio_chunk * audio_chunk))) >= 0.003:
-                    last_output_speech_time = output_now
-                self.speaking = (
-                    last_output_speech_time is not None
-                    and output_now - last_output_speech_time <= self.speech_hangover_seconds
-                )
-
-                if tick % 2 == 0:
-                    if self.speaking:
-                        with self._frame_lock:
-                            frame = self._latest_frame.copy()
+                if self._interrupt_requested.is_set():
+                    self._interrupt_requested.clear()
+                    if playback_audio is not None:
+                        response_started = False
+                        response_end_sent = False
+                        discard_response = False
+                    elif response_started:
+                        if not response_end_sent:
+                            self._connection.sendall(b"\x02")
+                            response_end_sent = True
+                        discard_response = True
                     else:
-                        frame = self._idle_frame.copy()
-                    self.output.push_video_frame(frame)
-                    self.record_video_data(frame)
+                        discard_response = False
+                    playback_audio = None
+                    playback_frames = None
+                    playback_index = 0
+                    response_audio.clear()
+                    response_frames.clear()
+                    self.speaking = False
+
+                if playback_audio is not None:
+                    audio_chunk, eventpoint = playback_audio[playback_index]
+                    pcm16 = np.clip(audio_chunk * 32767.0, -32768, 32767).astype("<i2")
+                    video_frame = None
+                    if playback_index % 2 == 0 and playback_frames:
+                        video_slot = playback_index // 2
+                        output_video_slots = (len(playback_audio) + 1) // 2
+                        frame_index = min(
+                            video_slot * len(playback_frames) // output_video_slots,
+                            len(playback_frames) - 1,
+                        )
+                        encoded = np.frombuffer(playback_frames[frame_index], dtype=np.uint8)
+                        video_frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                        if video_frame is None:
+                            raise RuntimeError("Could not decode a generated Ditto frame")
+                    self.output.push_media_bundle(pcm16, video_frame, eventpoint)
+                    self.record_audio_data(pcm16)
+                    if video_frame is not None:
+                        self.record_video_data(video_frame)
+                    self.speaking = (
+                        float(np.sqrt(np.mean(audio_chunk * audio_chunk))) >= 0.003
+                    )
+                    playback_index += 1
+                    if playback_index >= len(playback_audio):
+                        playback_audio = None
+                        playback_frames = None
+                        playback_index = 0
+                        response_audio.clear()
+                        response_frames.clear()
+                        response_started = False
+                        response_end_sent = False
+                        discard_response = False
+                        self.speaking = False
+                else:
+                    if response_started and not response_end_sent:
+                        try:
+                            audio_chunk, eventpoint = self.audio_queue.get_nowait()
+                        except queue.Empty:
+                            audio_chunk = None
+                            eventpoint = {}
+                        if audio_chunk is not None:
+                            response_audio.append((audio_chunk, eventpoint))
+                            self._connection.sendall(
+                                b"\x01"
+                                + np.clip(
+                                    audio_chunk * 32767.0, -32768, 32767
+                                ).astype("<i2").tobytes()
+                            )
+                            last_audio_received = time.monotonic()
+                            if eventpoint.get("status") == "end":
+                                self._connection.sendall(b"\x02")
+                                response_end_sent = True
+                        elif (
+                            last_audio_received is not None
+                            and time.monotonic() - last_audio_received >= 1.0
+                        ):
+                            self._connection.sendall(b"\x02")
+                            response_end_sent = True
+                            logger.warning(
+                                "Ditto ended an audio response after 1 second without more audio"
+                            )
+
+                    elif not response_started:
+                        try:
+                            audio_chunk, eventpoint = self.audio_queue.get_nowait()
+                        except queue.Empty:
+                            audio_chunk = None
+                            eventpoint = {}
+                        if audio_chunk is not None:
+                            response_started = True
+                            response_audio.append((audio_chunk, eventpoint))
+                            self._connection.sendall(
+                                b"\x01"
+                                + np.clip(
+                                    audio_chunk * 32767.0, -32768, 32767
+                                ).astype("<i2").tobytes()
+                            )
+                            last_audio_received = time.monotonic()
+                            if eventpoint.get("status") == "end":
+                                self._connection.sendall(b"\x02")
+                                response_end_sent = True
+
+                    while True:
+                        try:
+                            generated = self.video_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if generated is _END_RESPONSE:
+                            if discard_response:
+                                response_audio.clear()
+                                response_frames.clear()
+                                response_started = False
+                                response_end_sent = False
+                                discard_response = False
+                            elif response_audio:
+                                if not response_frames:
+                                    logger.error(
+                                        "Ditto completed an utterance without generating video; response discarded"
+                                    )
+                                    response_audio.clear()
+                                    response_started = False
+                                    response_end_sent = False
+                                else:
+                                    playback_audio = response_audio
+                                    playback_frames = response_frames
+                                    playback_index = 0
+                                    logger.info(
+                                        "Ditto response ready: %d audio packets, %d generated frames",
+                                        len(playback_audio),
+                                        len(playback_frames),
+                                    )
+                            break
+                        if not discard_response:
+                            response_frames.append(generated)
+
+                    pcm16 = np.zeros((self.chunk,), dtype="<i2")
+                    video_frame = None
+                    if tick % 2 == 0:
+                        video_frame = self._get_idle_frame(
+                            time.monotonic(), idle_loop_start
+                        )
+                    self.output.push_media_bundle(pcm16, video_frame)
+                    self.record_audio_data(pcm16)
+                    if video_frame is not None:
+                        self.record_video_data(video_frame)
 
                 tick += 1
                 next_audio_time += 0.02
@@ -190,6 +348,9 @@ class DittoAvatar(BaseAvatar):
 
                 if self._reader_error is not None:
                     raise RuntimeError("Ditto worker video stream failed") from self._reader_error
+        except (ConnectionResetError, BrokenPipeError) as error:
+            if not quit_event.is_set():
+                logger.warning("Ditto worker connection closed: %s", error)
         except (OSError, RuntimeError):
             if not quit_event.is_set():
                 logger.exception("Ditto avatar stream failed")

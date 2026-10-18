@@ -55,7 +55,7 @@ class PlayerStreamTrack(MediaStreamTrack):
         super().__init__()  # don't forget this!
         self.kind = kind
         self._player = player
-        queue_size = (5 if kind == 'video' else 10) if player._drop_stale_media else 100
+        queue_size = (25 if kind == 'video' else 50) if player._drop_stale_media else 100
         self._queue = queue.Queue(maxsize=queue_size)
         self.timelist = [] #记录最近包的时间戳
         self.current_frame_count = 0
@@ -145,12 +145,19 @@ class PlayerStreamTrack(MediaStreamTrack):
         #     else:
         while True:
             try:
-                frame, eventpoint = self._queue.get_nowait()
+                item = self._queue.get_nowait()
                 break
             except queue.Empty:
                 await asyncio.sleep(0.005)
-                
-        pts, time_base = await self.next_timestamp()
+        if len(item) == 4:
+            frame, eventpoint, pts, time_base = item
+            target_time = self._player._media_start_time + float(pts * time_base)
+            wait = target_time - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        else:
+            frame, eventpoint = item
+            pts, time_base = await self.next_timestamp()
         frame.pts = pts
         frame.time_base = time_base
         if eventpoint and self._player is not None:
@@ -201,6 +208,10 @@ class HumanPlayer:
         )
         self._drop_stale_media = self._synchronize_tracks
         self._media_start_time = None
+        self._media_audio_pts = 0
+        self._media_video_pts = 0
+        self._media_last_push_time = None
+        self._media_bundle_lock = threading.RLock()
 
         self.__audio = PlayerStreamTrack(self, kind="audio")
         self.__video = PlayerStreamTrack(self, kind="video")
@@ -212,14 +223,81 @@ class HumanPlayer:
     def push_video(self, frame):
         from av import VideoFrame
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        self._enqueue_media(self.__video, (new_frame, None))
+        with self._media_bundle_lock:
+            if self._synchronize_tracks:
+                pts, time_base = self._next_media_pts("video", 3600)
+                self._enqueue_media(self.__video, (new_frame, None, pts, time_base))
+            else:
+                self._enqueue_media(self.__video, (new_frame, None))
 
     def push_audio(self, frame, eventpoint=None):
         from av import AudioFrame
         new_frame = AudioFrame(format='s16', layout='mono', samples=frame.shape[0])
         new_frame.planes[0].update(frame.tobytes())
         new_frame.sample_rate = 16000
-        self._enqueue_media(self.__audio, (new_frame, eventpoint))
+        with self._media_bundle_lock:
+            if self._synchronize_tracks:
+                pts, time_base = self._next_media_pts("audio", new_frame.samples)
+                self._enqueue_media(
+                    self.__audio, (new_frame, eventpoint, pts, time_base)
+                )
+            else:
+                self._enqueue_media(self.__audio, (new_frame, eventpoint))
+
+    def push_media_bundle(self, audio_frame, video_frame=None, eventpoint=None):
+        from av import AudioFrame, VideoFrame
+
+        new_audio = AudioFrame(
+            format='s16', layout='mono', samples=audio_frame.shape[0]
+        )
+        new_audio.planes[0].update(audio_frame.tobytes())
+        new_audio.sample_rate = SAMPLE_RATE
+        new_video = (
+            VideoFrame.from_ndarray(video_frame, format="bgr24")
+            if video_frame is not None
+            else None
+        )
+        with self._media_bundle_lock:
+            if not self._synchronize_tracks:
+                self._enqueue_media(self.__audio, (new_audio, eventpoint))
+                if new_video is not None:
+                    self._enqueue_media(self.__video, (new_video, None))
+                return
+
+            self._advance_media_clock()
+            audio_pts = self._media_audio_pts
+            self._media_audio_pts += new_audio.samples
+            self._enqueue_media(
+                self.__audio,
+                (new_audio, eventpoint, audio_pts, AUDIO_TIME_BASE),
+            )
+            if new_video is not None:
+                video_pts = self._media_video_pts
+                self._media_video_pts += 3600
+                self._enqueue_media(
+                    self.__video,
+                    (new_video, None, video_pts, VIDEO_TIME_BASE),
+                )
+
+    def _advance_media_clock(self):
+        now = time.monotonic()
+        if self._media_start_time is None:
+            self._media_start_time = now
+        if self._media_last_push_time is not None:
+            elapsed = now - self._media_last_push_time
+            if elapsed > AUDIO_PTIME * 3:
+                self._media_start_time += elapsed - AUDIO_PTIME
+        self._media_last_push_time = now
+
+    def _next_media_pts(self, kind, duration):
+        self._advance_media_clock()
+        if kind == "audio":
+            pts = self._media_audio_pts
+            self._media_audio_pts += duration
+            return pts, AUDIO_TIME_BASE
+        pts = self._media_video_pts
+        self._media_video_pts += duration
+        return pts, VIDEO_TIME_BASE
 
     def _enqueue_media(self, track, item):
         if not self._drop_stale_media:

@@ -41,6 +41,11 @@ class BaseOutput(ABC):
         """推送音频帧"""
         ...
 
+    def push_media_bundle(self, audio_frame, video_frame=None, eventpoint=None) -> None:
+        """Push related audio/video together, with video optional for audio-only ticks."""
+        self.push_audio_frame(audio_frame, eventpoint)
+        if video_frame is not None:
+            self.push_video_frame(video_frame)
 
     def get_buffer_size(self) -> int:
         """获取底层发送队列的积压帧数，用于引擎降速限流"""
