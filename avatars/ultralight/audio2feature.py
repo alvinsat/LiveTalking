@@ -1,14 +1,38 @@
 from transformers import Wav2Vec2Processor, HubertModel
 import torch
 import numpy as np
+from utils.device import initialize_device
+from utils.openvino import compile_torch_model
+
+
+class _HubertLastHiddenState(torch.nn.Module):
+    def __init__(self, wrapped_model):
+        super().__init__()
+        self.wrapped_model = wrapped_model
+
+    def forward(self, input_values):
+        return self.wrapped_model(input_values).last_hidden_state
 
 
 class Audio2Feature():
-    def __init__(self):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    def __init__(self, backend='torch', openvino_device='AUTO'):
+        self.backend = backend
+        self.device = torch.device('cpu') if backend == 'openvino' else initialize_device()
         self.processor = Wav2Vec2Processor.from_pretrained("./models/hubert-large-ls960-ft")
-        self.model = HubertModel.from_pretrained("./models/hubert-large-ls960-ft").to(self.device) #.half()
-        self.model.requires_grad_(False)
+        model_path = "./models/hubert-large-ls960-ft"
+        model = HubertModel.from_pretrained(model_path).eval()
+        model.requires_grad_(False)
+        if backend == 'openvino':
+            self.model = compile_torch_model(
+                _HubertLastHiddenState(model),
+                (torch.zeros(1, 16000),),
+                openvino_device,
+                "hubert-large-ls960-ft",
+                source_paths=(model_path,),
+                dynamic_input_shapes={0: [-1, -1]},
+            )
+        else:
+            self.model = model.to(self.device)
 
 
     @torch.no_grad()
@@ -32,7 +56,7 @@ class Audio2Feature():
                 start_idx = clip_length * i
                 end_idx = start_idx + (clip_length - stride + kernel)
             input_values = input_values_all[:, start_idx: end_idx]
-            hidden_states = self.model.forward(input_values).last_hidden_state  # [B=1, T=pts//320, hid=1024]
+            hidden_states = self._last_hidden_state(input_values)
             #print(f"Processing chunk {i+1}/{num_iter}, input_values_all shape:{input_values_all.shape} ,input shape: {input_values.shape}, hidden_states shape: {hidden_states.shape}")
             res_lst.append(hidden_states[0])
         if num_iter > 0:
@@ -42,7 +66,7 @@ class Audio2Feature():
         if input_values.shape[1] >= kernel:  # if the last batch is shorter than kernel_size, skip it
             # with torch.no_grad():
             #     with torch.autocast(device_type="cuda", dtype=torch.float16):            
-            hidden_states = self.model(input_values).last_hidden_state  # [B=1, T=pts//320, hid=1024]
+            hidden_states = self._last_hidden_state(input_values)
         #print(f"input_values_all shape:{input_values_all.shape} ,input shape: {input_values.shape}, hidden_states shape: {hidden_states.shape}")
         res_lst.append(hidden_states[0])
         ret = torch.cat(res_lst, dim=0).cpu()  # [T, 1024]
@@ -52,6 +76,11 @@ class Audio2Feature():
         else:
             ret = ret[:expected_T]
         return ret
+
+    def _last_hidden_state(self, input_values):
+        if self.backend == 'openvino':
+            return self.model(input_values)
+        return self.model(input_values).last_hidden_state
 
     def get_sliced_feature(self,
                            feature_array:torch.Tensor,

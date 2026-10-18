@@ -88,6 +88,29 @@ cd LiveTalking
 pip install -r requirements.txt
 ```
 
+仅使用 OpenVINO 时不需要安装 PyTorch CUDA 版本，可改为安装 CPU 版本：
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+默认配置已启用 OpenVINO 推理。`AUTO` 必须选择可用的 Intel GPU；禁止回退到
+CPU。如果 GPU 不可用或模型无法完全在 GPU 上执行，服务会报错退出。可在
+`config.yaml` 设置具体 GPU 设备，或通过命令行指定：
+
+```bash
+python app.py --inference_backend openvino --openvino_device AUTO
+```
+
+使用 `--inference_backend torch` 可切回 PyTorch 后端。
+
+首次启动会将所选数字人模型及音频编码器从现有 PyTorch 权重转换为 OpenVINO，
+并缓存到 `models/openvino_cache/`。转换失败会明确报错，不会静默回退到 PyTorch。
+GPU 推理需要受支持的 Intel GPU 和驱动。
+
+Wav2Lip 使用固定批次和图像尺寸编译，避免动态形状导致 GPU 推理性能严重下降。
+音频特征处理和视频帧合成仍由独立 CPU 线程并行执行，模型推理使用 GPU。
+
 安装常见问题：[FAQ](https://doc.livetalking.ai/docs/faq/)
 
 Linux CUDA 环境搭建参考: <https://zhuanlan.zhihu.com/p/674972886>

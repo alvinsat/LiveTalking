@@ -12,6 +12,8 @@ r: 10
 model: wav2lip                 # musetalk / wav2lip / ultralight
 avatar_id: wav2lip256_avatar1
 batch_size: 16
+inference_backend: openvino    # openvino / torch
+openvino_device: AUTO          # GPU / AUTO (CPU inference is disabled)
 
 # -------- Custom Actions ----------------------------------------------------------
 customvideo_config: ''

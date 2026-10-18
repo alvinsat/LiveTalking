@@ -6,13 +6,63 @@ import cv2
 import numpy as np
 from PIL import Image
 import os
+from types import SimpleNamespace
+from utils.openvino import compile_torch_model
+
+
+class _VAEEncoder(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, image):
+        distribution = self.vae.encode(image).latent_dist
+        return distribution.mean, distribution.logvar
+
+
+class _VAEDecoder(torch.nn.Module):
+    def __init__(self, vae):
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, latents):
+        return self.vae.decode(latents).sample
+
+
+class _OpenVINOLatentDistribution:
+    def __init__(self, mean, logvar):
+        self.mean = mean
+        self.logvar = logvar
+
+    def mode(self):
+        return self.mean
+
+    def sample(self):
+        return self.mean + torch.exp(0.5 * self.logvar) * torch.randn_like(self.mean)
+
+
+class _OpenVINOVAE:
+    device = torch.device('cpu')
+    dtype = torch.float32
+
+    def __init__(self, encoder, decoder):
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def encode(self, image):
+        mean, logvar = self.encoder(image)
+        return SimpleNamespace(latent_dist=_OpenVINOLatentDistribution(mean, logvar))
+
+    def decode(self, latents):
+        return SimpleNamespace(sample=self.decoder(latents))
 
 class VAE():
     """
     VAE (Variational Autoencoder) class for image processing.
     """
 
-    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False):
+    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256,
+                 use_float16=False, device=None):
         """
         Initialize the VAE instance.
 
@@ -23,7 +73,9 @@ class VAE():
         self.model_path = model_path
         self.vae = AutoencoderKL.from_pretrained(self.model_path)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"))
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"))
+        self.device = torch.device(device)
         self.vae.to(self.device)
 
         if use_float16:
@@ -36,6 +88,25 @@ class VAE():
         self.transform = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         self._resized_img = resized_img
         self._mask_tensor = self.get_mask_tensor()
+
+    def to_openvino(self, device_name, batch_size=1):
+        vae_model = self.vae
+        encoder = compile_torch_model(
+            _VAEEncoder(vae_model),
+            (torch.zeros(batch_size, 3, self._resized_img, self._resized_img),),
+            device_name,
+            "musetalk-vae-encoder",
+            source_paths=(self.model_path,),
+        )
+        decoder = compile_torch_model(
+            _VAEDecoder(vae_model),
+            (torch.zeros(batch_size, 4, self._resized_img // 8, self._resized_img // 8),),
+            device_name,
+            "musetalk-vae-decoder",
+            source_paths=(self.model_path,),
+        )
+        self.vae = _OpenVINOVAE(encoder, decoder)
+        self.device = torch.device('cpu')
         
     def get_mask_tensor(self):
         """

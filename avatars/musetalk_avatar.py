@@ -20,6 +20,7 @@
 
 import math
 import torch
+from types import SimpleNamespace
 import numpy as np
 
 import subprocess
@@ -49,24 +50,75 @@ from tqdm import tqdm
 from utils.logger import logger
 from utils.image import read_imgs, mirror_index
 from utils.device import initialize_device
+from utils.openvino import compile_torch_model
 from registry import register
 
 device = initialize_device()
-logger.info('Using {} for inference.'.format(device))
+logger.info('PyTorch backend device available: {}'.format(device))
 
-def load_model():
+class _UNetSample(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, sample, timesteps, encoder_hidden_states):
+        return self.model(
+            sample,
+            timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+        ).sample
+
+
+class _OpenVINOUNet:
+    dtype = torch.float32
+    is_openvino = True
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, sample, timesteps, encoder_hidden_states):
+        output = self.model(sample, timesteps, encoder_hidden_states)
+        return SimpleNamespace(sample=output)
+
+
+def load_model(opt=None):
     # load model weights
-    vae, unet, pe = load_all_model()
-    #device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"))
-    timesteps = torch.tensor([0], device=device)
-    pe = pe.half().to(device)
-    vae.vae = vae.vae.half().to(device)
-    unet.model = unet.model.half().to(device)
+    use_openvino = opt is not None and opt.inference_backend == 'openvino'
+    inference_device = torch.device('cpu') if use_openvino else device
+    vae, unet, pe = load_all_model(device=inference_device)
+    timesteps = torch.tensor([0], device=inference_device)
+    if use_openvino:
+        vae.to_openvino(opt.openvino_device, batch_size=opt.batch_size)
+        unet_model_path = os.path.join("models", "musetalkV15", "unet.pth")
+        unet_config_path = os.path.join("models", "musetalkV15", "musetalk.json")
+        compiled_unet = compile_torch_model(
+            _UNetSample(unet.model),
+            (
+                torch.zeros(opt.batch_size, 8, 32, 32),
+                torch.zeros(1, dtype=torch.long),
+                torch.zeros(opt.batch_size, 50, 384),
+            ),
+            opt.openvino_device,
+            "musetalk-unet",
+            source_paths=(unet_model_path, unet_config_path),
+            dynamic_input_shapes={2: [opt.batch_size, -1, 384]},
+        )
+        unet.model = _OpenVINOUNet(compiled_unet)
+        unet.device = torch.device('cpu')
+    else:
+        timesteps = timesteps.to(device)
+        pe = pe.half().to(device)
+        vae.vae = vae.vae.half().to(device)
+        unet.model = unet.model.half().to(device)
     # Initialize audio processor and Whisper model
-    audio_processor = Audio2Feature(model_path="./models/whisper")
+    audio_processor = Audio2Feature(
+        model_path="./models/whisper",
+        backend='openvino' if use_openvino else 'torch',
+        openvino_device=getattr(opt, 'openvino_device', 'AUTO'),
+    )
     return vae, unet, pe, timesteps, audio_processor
 
-def load_avatar(avatar_id):
+def load_avatar(avatar_id, opt=None):
     avatar_path = f"./data/avatars/{avatar_id}"
     full_imgs_path = f"{avatar_path}/full_imgs" 
     coords_path = f"{avatar_path}/coords.pkl"
@@ -76,7 +128,8 @@ def load_avatar(avatar_id):
     mask_coords_path =f"{avatar_path}/mask_coords.pkl"
     avatar_info_path = f"{avatar_path}/avator_info.json"
 
-    input_latent_list_cycle = torch.load(latents_out_path)
+    map_location = 'cpu' if opt is not None and opt.inference_backend == 'openvino' else None
+    input_latent_list_cycle = torch.load(latents_out_path, map_location=map_location)
     with open(coords_path, 'rb') as f:
         coord_list_cycle = pickle.load(f)
     frame_list_cycle = None

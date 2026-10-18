@@ -2,6 +2,11 @@
 <html lang="zh-CN">
 
 <head>
+    <script>
+        if (new URLSearchParams(window.location.search).get('lang') !== 'zh') {
+            window.location.replace('./index-en.html');
+        }
+    </script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TTS 语音管理 - LiveTalking</title>

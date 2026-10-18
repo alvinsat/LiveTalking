@@ -7,6 +7,21 @@ import sys
 from transformers import AutoFeatureExtractor
 from transformers import WhisperModel
 import torch
+from utils.openvino import compile_torch_model
+
+
+class _WhisperHiddenStates(torch.nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, input_features):
+        hidden_states = self.encoder(
+            input_features, output_hidden_states=True
+        ).hidden_states
+        return torch.stack(hidden_states, dim=2)
+
+
 sys.path.append("..")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -14,13 +29,24 @@ weight_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 class Audio2Feature():
     def __init__(self, 
                  whisper_model_type="tiny",
-                 model_path="./models/whisper"):
+                 model_path="./models/whisper",
+                 backend="torch",
+                 openvino_device="AUTO"):
         # self.whisper_model_type = whisper_model_type
         # self.model = load_model(model_path) #
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_path)
-        self.whisper = WhisperModel.from_pretrained(model_path)
-        self.whisper = self.whisper.to(device=device, dtype=weight_dtype).eval()
-        self.whisper.requires_grad_(False)
+        whisper = WhisperModel.from_pretrained(model_path).eval()
+        whisper.requires_grad_(False)
+        if backend == "openvino":
+            self.whisper = compile_torch_model(
+                _WhisperHiddenStates(whisper.encoder),
+                (torch.zeros(1, 80, 3000),),
+                openvino_device,
+                "musetalk-whisper-encoder",
+                source_paths=(model_path,),
+            )
+        else:
+            self.whisper = whisper.to(device=device, dtype=weight_dtype)
 
     def get_sliced_feature(self,
                            feature_array, 
@@ -109,6 +135,8 @@ class Audio2Feature():
             return_tensors="pt",
             sampling_rate=16000
         ).input_features
+        if getattr(self.whisper, "is_openvino", False):
+            return self.whisper(input_feature).squeeze(0).numpy()
         input_feature = input_feature.to(device).to(weight_dtype)
         whisper_feature = self.whisper.encoder(input_feature, output_hidden_states=True).hidden_states
         #print(f"input_feature shape:{input_feature.shape}, whisper_feature shape:{whisper_feature[0].shape}, whisper_feature len:{len(whisper_feature)}")

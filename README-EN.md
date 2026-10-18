@@ -85,6 +85,35 @@ cd LiveTalking
 pip install -r requirements.txt
 ```
 
+For an OpenVINO-only setup, the PyTorch CUDA wheel is not required; install a
+CPU PyTorch build instead:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+OpenVINO inference is enabled by default in `config.yaml`. `AUTO` requires and
+selects an available Intel GPU; CPU fallback is disabled. Startup fails if the
+GPU is unavailable or a model cannot execute entirely on it. Set `openvino_device`
+to a specific GPU device, or override it on the command line:
+
+```bash
+python app.py --inference_backend openvino --openvino_device AUTO
+```
+
+Use `--inference_backend torch` to keep using the PyTorch backend.
+
+The first start converts the selected avatar model and audio encoder from the
+existing PyTorch checkpoints and caches OpenVINO IR files under
+`models/openvino_cache/`. Conversion errors are reported; the server does not
+silently switch back to PyTorch. OpenVINO GPU execution requires a supported
+Intel GPU and its driver.
+
+Wav2Lip is compiled with fixed batch and image dimensions to avoid the severe
+performance penalty of dynamic-shape GPU inference. Audio feature preparation
+and frame composition continue on CPU in separate pipeline threads while the
+model runs on the GPU.
+
 Installation FAQ: <https://doc.livetalking.ai/en/docs/faq/>
 
 Linux CUDA environment setup: <https://zhuanlan.zhihu.com/p/674972886>

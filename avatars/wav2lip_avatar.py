@@ -43,33 +43,50 @@ from tqdm import tqdm
 from utils.logger import logger
 from utils.image import read_imgs, mirror_index
 from utils.device import initialize_device
+from utils.openvino import compile_torch_model
 from registry import register
 
 device = initialize_device()
-logger.info('Using {} for inference.'.format(device))
+logger.info('PyTorch backend device available: {}'.format(device))
 
-def _load(checkpoint_path):
-    if device == 'cuda':
+def _load(checkpoint_path, openvino=False):
+    if not openvino and device.type == 'cuda':
         checkpoint = torch.load(checkpoint_path)
     else:
         checkpoint = torch.load(checkpoint_path,
                                 map_location=lambda storage, loc: storage)
     return checkpoint
 
-def load_model(path):
+def load_model(path, opt=None):
     model = Wav2Lip()
     logger.info("Load checkpoint from: {}".format(path))
-    checkpoint = _load(path)
+    use_openvino = opt is not None and opt.inference_backend == 'openvino'
+    checkpoint = _load(path, openvino=use_openvino)
     s = checkpoint["state_dict"]
     new_s = {}
     for k, v in s.items():
         new_s[k.replace('module.', '')] = v
     model.load_state_dict(new_s)
 
+    if use_openvino:
+        batch_size = opt.batch_size
+        examples = (
+            torch.zeros(batch_size, 1, 80, 16),
+            torch.zeros(batch_size, 6, 256, 256),
+        )
+        return compile_torch_model(
+            model, examples, opt.openvino_device, "wav2lip",
+            source_paths=(path,),
+            static_input_shapes={
+                index: tuple(example.shape)
+                for index, example in enumerate(examples)
+            },
+        )
+
     model = model.to(device)
     return model.eval()
 
-def load_avatar(avatar_id):
+def load_avatar(avatar_id, opt=None):
     avatar_path = f"./data/avatars/{avatar_id}"
     full_imgs_path = f"{avatar_path}/full_imgs" 
     face_imgs_path = f"{avatar_path}/face_imgs" 
@@ -91,8 +108,9 @@ def load_avatar(avatar_id):
 def warm_up(batch_size,model,modelres):
     # 预热函数
     logger.info('warmup model...')
-    img_batch = torch.ones(batch_size, 6, modelres, modelres).to(device)
-    mel_batch = torch.ones(batch_size, 1, 80, 16).to(device)
+    inference_device = torch.device('cpu') if getattr(model, 'is_openvino', False) else device
+    img_batch = torch.ones(batch_size, 6, modelres, modelres).to(inference_device)
+    mel_batch = torch.ones(batch_size, 1, 80, 16).to(inference_device)
     model(mel_batch, img_batch)
 
 @register("avatar", "wav2lip")
@@ -124,17 +142,36 @@ class LipReal(BaseAvatar):
             img_batch.append(face)
         img_batch, audiofeat_batch = np.asarray(img_batch), np.asarray(audiofeat_batch)
 
-        img_masked = img_batch.copy()
-        img_masked[:, face.shape[0]//2:] = 0
+        if getattr(self.model, 'is_openvino', False):
+            batch, height, width, _ = img_batch.shape
+            model_images = np.empty((batch, 6, height, width), dtype=np.float32)
+            face_images = np.transpose(img_batch, (0, 3, 1, 2))
+            model_images[:, :3] = face_images
+            model_images[:, :3, height // 2:, :] = 0
+            model_images[:, 3:] = face_images
+            model_images /= 255.0
+            model_audio = np.ascontiguousarray(
+                audiofeat_batch[:, np.newaxis, :, :],
+                dtype=np.float32,
+            )
+        else:
+            img_masked = img_batch.copy()
+            img_masked[:, face.shape[0] // 2:] = 0
 
-        img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
-        audiofeat_batch = np.reshape(audiofeat_batch, [len(audiofeat_batch), audiofeat_batch.shape[1], audiofeat_batch.shape[2], 1])
-        
-        img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-        audiofeat_batch = torch.FloatTensor(np.transpose(audiofeat_batch, (0, 3, 1, 2))).to(device)
+            img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
+            audiofeat_batch = np.reshape(
+                audiofeat_batch,
+                [len(audiofeat_batch), audiofeat_batch.shape[1], audiofeat_batch.shape[2], 1],
+            )
+            model_images = torch.FloatTensor(
+                np.transpose(img_batch, (0, 3, 1, 2))
+            ).to(device)
+            model_audio = torch.FloatTensor(
+                np.transpose(audiofeat_batch, (0, 3, 1, 2))
+            ).to(device)
 
         with torch.no_grad():
-            pred = self.model(audiofeat_batch, img_batch)
+            pred = self.model(model_audio, model_images)
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
         return pred
 
@@ -145,4 +182,3 @@ class LipReal(BaseAvatar):
         res_frame = cv2.resize(pred_frame.astype(np.uint8),(x2-x1,y2-y1))
         combine_frame[y1:y2, x1:x2] = res_frame
         return combine_frame
-

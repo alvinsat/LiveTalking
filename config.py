@@ -65,6 +65,10 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
     parser.add_argument('--modelres', type=int, default=192)
     parser.add_argument('--modelfile', type=str, default='')
+    parser.add_argument('--inference_backend', choices=('torch', 'openvino'),
+                        default='openvino', help="inference runtime")
+    parser.add_argument('--openvino_device', type=str, default='AUTO',
+                        help="OpenVINO GPU device, or AUTO to require and select a GPU")
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',

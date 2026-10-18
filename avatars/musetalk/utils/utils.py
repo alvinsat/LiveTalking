@@ -20,6 +20,7 @@ def load_all_model(
 ):
     vae = VAE(
         model_path = os.path.join("models", vae_type),
+        device=device,
     )
     print(f"load unet model from {unet_model_path}")
     unet = UNet(

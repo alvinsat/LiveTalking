@@ -51,6 +51,7 @@ import torch
 from io import BytesIO
 from typing import Dict
 from utils.logger import logger
+from utils.device import initialize_device, inference_device_type
 import copy
 import gc
 from dotenv import load_dotenv
@@ -84,7 +85,7 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     if (avatar_id and avatar_id != opt.avatar_id):
         # Avoid reloading if already cached globally
         if avatar_id not in global_avatars:
-            global_avatars[avatar_id] = load_avatar(avatar_id)
+            global_avatars[avatar_id] = load_avatar(avatar_id, opt)
         avatar_this = global_avatars[avatar_id]
     else:
         # Default avatar loaded at startup
@@ -107,6 +108,8 @@ async def whep(request):
 
 async def on_shutdown(app):
     await rtc_manager.shutdown()
+    for sessionid in tuple(session_manager.sessions):
+        session_manager.remove_session(sessionid)
 
 async def download_record(request):
     sessionid = request.match_info.get('sessionid')
@@ -139,18 +142,30 @@ def main():
     load_avatar = avatar_mod.load_avatar
     warm_up = avatar_mod.warm_up
     logger.info(opt)
+    logger.info(
+        "Inference backend: %s%s",
+        opt.inference_backend,
+        f" ({opt.openvino_device})" if opt.inference_backend == 'openvino' else '',
+    )
+    if opt.inference_backend == 'torch':
+        torch_device = initialize_device()
+        logger.info(
+            "Inference device: %s (%s)",
+            inference_device_type(torch_device),
+            torch_device,
+        )
 
     if opt.model == 'musetalk':
-        model = load_model()
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id) 
+        model = load_model(opt)
+        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id, opt)
         warm_up(opt.batch_size,model)      
     elif opt.model == 'wav2lip':
-        model = load_model("./models/wav2lip.pth")
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
+        model = load_model("./models/wav2lip.pth", opt)
+        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id, opt)
         warm_up(opt.batch_size,model,256)
     elif opt.model == 'ultralight':
         model = load_model(opt)
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
+        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id, opt)
         warm_up(opt.batch_size,global_avatars[opt.avatar_id],160)
 
     # init rtc manager
@@ -160,6 +175,8 @@ def main():
     # share avatar_sessions (RTCManager handles it but routes.py expects it)
 
     # 虚拟摄像头或 RTMP 模式：启动后台渲染线程
+    thread_quit = None
+    rendthrd = None
     if opt.transport == 'virtualcam' or opt.transport == 'rtmp':
         thread_quit = Event()
         params = {}
@@ -205,16 +222,37 @@ def main():
     def run_server(runner):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(runner.setup())
-        site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
-        loop.run_until_complete(site.start())
-        if opt.transport=='rtcpush':
-            for k in range(opt.max_session):
-                push_url = opt.push_url
-                if k!=0:
-                    push_url = opt.push_url+str(k)
-                loop.run_until_complete(rtc_manager.handle_rtcpush(push_url, str(k)))
-        loop.run_forever()    
+        runner_setup = False
+        try:
+            loop.run_until_complete(runner.setup())
+            runner_setup = True
+            site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
+            loop.run_until_complete(site.start())
+            if opt.transport == 'rtcpush':
+                for k in range(opt.max_session):
+                    push_url = opt.push_url
+                    if k != 0:
+                        push_url = opt.push_url + str(k)
+                    loop.run_until_complete(
+                        rtc_manager.handle_rtcpush(push_url, str(k))
+                    )
+            logger.info('Server is running. Press Ctrl+C to stop.')
+            try:
+                loop.run_forever()
+            except KeyboardInterrupt:
+                logger.info('Ctrl+C received; shutting down server...')
+        finally:
+            try:
+                if runner_setup:
+                    loop.run_until_complete(runner.cleanup())
+            finally:
+                if thread_quit is not None:
+                    thread_quit.set()
+                if rendthrd is not None:
+                    rendthrd.join()
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
+
     #Thread(target=run_server, args=(web.AppRunner(appasync),)).start()
     run_server(web.AppRunner(appasync))
 

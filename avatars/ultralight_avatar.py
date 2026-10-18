@@ -50,24 +50,43 @@ from avatars.ultralight.audio2feature import Audio2Feature
 from utils.logger import logger
 from utils.image import read_imgs, mirror_index
 from utils.device import initialize_device
+from utils.openvino import compile_torch_model
 from registry import register
 
 device = initialize_device()
-logger.info('Using {} for inference.'.format(device))
+logger.info('PyTorch backend device available: {}'.format(device))
 
 def load_model(opt):
-    audio_processor = Audio2Feature()
+    backend = getattr(opt, 'inference_backend', 'torch')
+    audio_processor = Audio2Feature(
+        backend=backend,
+        openvino_device=getattr(opt, 'openvino_device', 'AUTO'),
+    )
     model = None
     return audio_processor,model
 
-def load_avatar(avatar_id):
+def load_avatar(avatar_id, opt=None):
     avatar_path = f"./data/avatars/{avatar_id}"
     full_imgs_path = f"{avatar_path}/full_imgs" 
     face_imgs_path = f"{avatar_path}/face_imgs" 
     coords_path = f"{avatar_path}/coords.pkl" 
     
-    model = Model(6, 'hubert').to(device)
-    model.load_state_dict(torch.load(f"{avatar_path}/ultralight.pth"))
+    model_path = f"{avatar_path}/ultralight.pth"
+    model = Model(6, 'hubert')
+    model.load_state_dict(torch.load(model_path, map_location='cpu'))
+    if opt is not None and opt.inference_backend == 'openvino':
+        model = compile_torch_model(
+            model,
+            (
+                torch.zeros(opt.batch_size, 6, 160, 160),
+                torch.zeros(opt.batch_size, 16, 32, 32),
+            ),
+            opt.openvino_device,
+            "ultralight",
+            source_paths=(model_path,),
+        )
+    else:
+        model = model.to(device)
     
     with open(coords_path, 'rb') as f:
         coord_list_cycle = pickle.load(f)
@@ -78,15 +97,18 @@ def load_avatar(avatar_id):
     input_face_list = sorted(input_face_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
     face_list_cycle = read_imgs(input_face_list)
 
-    return model.eval(),frame_list_cycle,face_list_cycle,coord_list_cycle
+    if not getattr(model, 'is_openvino', False):
+        model = model.eval()
+    return model,frame_list_cycle,face_list_cycle,coord_list_cycle
 
 
 @torch.no_grad()
 def warm_up(batch_size,avatar,modelres):
     logger.info('warmup model...')
     model,_,_,_ = avatar
-    img_batch = torch.ones(batch_size, 6, modelres, modelres).to(device)
-    mel_batch = torch.ones(batch_size, 16, 32, 32).to(device)
+    inference_device = torch.device('cpu') if getattr(model, 'is_openvino', False) else device
+    img_batch = torch.ones(batch_size, 6, modelres, modelres).to(inference_device)
+    mel_batch = torch.ones(batch_size, 16, 32, 32).to(inference_device)
     model(img_batch, mel_batch)
 
 # def get_audio_features(features, index):
@@ -165,8 +187,9 @@ class LightReal(BaseAvatar):
         audiofeat_batch = torch.stack([torch.from_numpy(arr) for arr in reshaped_audiofeat_batch])
         img_batch = torch.stack(img_batch).squeeze(1)
 
+        inference_device = torch.device('cpu') if getattr(self.model, 'is_openvino', False) else device
         with torch.no_grad():
-            pred = self.model(img_batch.cuda(), audiofeat_batch.cuda())
+            pred = self.model(img_batch.to(inference_device), audiofeat_batch.to(inference_device))
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
         return pred
     
